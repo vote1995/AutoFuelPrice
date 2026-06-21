@@ -50,11 +50,36 @@ const PRICE_CHANGE_THRESHOLD: f64 = 0.01;
 /// Thai-language LINE message header.
 const MESSAGE_HEADER: &str = "📰 แจ้งข่าวราคาน้ำมัน!!";
 
+/// Date line prefix shown below the header.
+const DATE_LABEL: &str = "📅 ราคาปรับขึ้น-ลง วันที่";
+
+/// Emoji bullet placed before each oil type name.
+const OIL_TYPE_BULLET: &str = "⛽";
+
+/// Arrow glyph drawn after the bullet, before the oil name.
+const OIL_TYPE_ARROW: &str = "▶";
+
 /// Thai word for a price decrease.
 const DIRECTION_DECREASE: &str = "ลด";
 
 /// Thai word for a price increase.
 const DIRECTION_INCREASE: &str = "เพิ่ม";
+
+/// English → Thai month names (index 0 = January).
+const THAI_MONTHS: [&str; 12] = [
+    "มกราคม",
+    "กุมภาพันธ์",
+    "มีนาคม",
+    "เมษายน",
+    "พฤษภาคม",
+    "มิถุนายน",
+    "กรกฎาคม",
+    "สิงหาคม",
+    "กันยายน",
+    "ตุลาคม",
+    "พฤศจิกายน",
+    "ธันวาคม",
+];
 
 // ---- Domain types ------------------------------------------------------------
 
@@ -73,6 +98,13 @@ struct PriceSnapshot {
     /// `OilPriceDate` returned by Bangchak (dd/MM/yyyy). Used to detect
     /// whether the API has published a new dataset since the last run.
     source_date: String,
+    /// Thai-formatted effective date parsed from `OilRemark2`
+    /// (e.g. "19 มิถุนายน 2026"). Empty when the API omitted the remark.
+    #[serde(default)]
+    effective_date: String,
+    /// Effective time parsed from `OilRemark2` (e.g. "05:00").
+    #[serde(default)]
+    effective_time: String,
     entries: Vec<FuelEntry>,
 }
 
@@ -103,6 +135,8 @@ struct BangchakWire {
     oil_price_date: String,
     #[serde(rename = "OilList")]
     oil_list: String,
+    #[serde(rename = "OilRemark2", default)]
+    oil_remark2: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +154,8 @@ struct BangchakOilItem {
 /// Result of fetching + parsing the Bangchak payload.
 struct BangchakResponse {
     oil_price_date: String,
+    effective_date: String,
+    effective_time: String,
     items: Vec<FuelEntry>,
 }
 
@@ -246,6 +282,8 @@ async fn run_once(config: &AppConfig) -> Result<()> {
     let current = PriceSnapshot {
         captured_at: now.to_rfc3339(),
         source_date: response.oil_price_date.clone(),
+        effective_date: response.effective_date.clone(),
+        effective_time: response.effective_time.clone(),
         entries: response.items,
     };
 
@@ -273,7 +311,14 @@ async fn run_once(config: &AppConfig) -> Result<()> {
             return Ok(());
         }
 
-        if let Err(error) = notify_line(config, &changes).await {
+        if let Err(error) = notify_line(
+            config,
+            &current.effective_date,
+            &current.effective_time,
+            &changes,
+        )
+        .await
+        {
             warn!(
                 error = %error,
                 "LINE push failed — NOT persisting state, will retry next run"
@@ -321,10 +366,67 @@ async fn fetch_prices(http: &Client) -> Result<BangchakResponse> {
         })
         .collect::<Vec<_>>();
 
+    let (effective_date, effective_time) = parse_effective_datetime(&payload.oil_remark2);
+
     Ok(BangchakResponse {
         oil_price_date: payload.oil_price_date,
+        effective_date,
+        effective_time,
         items: entries,
     })
+}
+
+// ---- Effective date parsing ------------------------------------------------
+
+/// Parses Bangchak's `OilRemark2` to extract the effective date/time.
+///
+/// Expected input shape:
+/// `Are effective on 19 June 2026 from 05:00 AM`
+///
+/// Returns `(thai_date, time)` — e.g. `("19 มิถุนายน 2026", "05:00")`.
+/// Returns `("", "")` if parsing fails so the caller can gracefully
+/// omit the date line from the message.
+fn parse_effective_datetime(remark: &str) -> (String, String) {
+    const ENGLISH_MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+
+    let words: Vec<&str> = remark.split_whitespace().collect();
+    // Expected tokens:
+    // ["Are", "effective", "on", "19", "June", "2026", "from", "05:00", "AM"]
+    if words.len() < 9 {
+        return (String::new(), String::new());
+    }
+
+    let day = match words[3].parse::<u32>() {
+        Ok(value) => value,
+        Err(_) => return (String::new(), String::new()),
+    };
+    let month_en = words[4];
+    let year = match words[5].parse::<u32>() {
+        Ok(value) => value,
+        Err(_) => return (String::new(), String::new()),
+    };
+    let time = words[7];
+
+    let month_idx = match ENGLISH_MONTHS.iter().position(|&m| m == month_en) {
+        Some(idx) => idx,
+        None => return (String::new(), String::new()),
+    };
+    let month_thai = THAI_MONTHS[month_idx];
+
+    (format!("{} {} {}", day, month_thai, year), time.to_string())
 }
 
 // ---- Change detection --------------------------------------------------------
@@ -355,8 +457,13 @@ fn compute_changes(snapshot: &PriceSnapshot) -> Vec<PriceChange> {
 
 // ---- Notify ------------------------------------------------------------------
 
-async fn notify_line(config: &AppConfig, changes: &[PriceChange]) -> Result<()> {
-    let text = format_message(changes);
+async fn notify_line(
+    config: &AppConfig,
+    effective_date: &str,
+    effective_time: &str,
+    changes: &[PriceChange],
+) -> Result<()> {
+    let text = format_message(effective_date, effective_time, changes);
 
     // Dry-run mode: render the message that *would* be sent and stop.
     // Useful for verifying format without burning a LINE push.
@@ -409,14 +516,31 @@ async fn notify_line(config: &AppConfig, changes: &[PriceChange]) -> Result<()> 
 /// Layout:
 /// ```text
 /// 📰 แจ้งข่าวราคาน้ำมัน!!
+/// 📅 ราคาปรับขึ้น-ลง วันที่ <date> เวลา <time> น.
 ///
-/// <name> ปรับลด/เพิ่ม <diff> บาท
+/// ⛽ ▶ <name>
+/// ปรับลด/เพิ่ม <diff> บาท
 /// จากราคา <old> บาท เป็น <new> บาท
 ///
-/// <name> ปรับลด/เพิ่ม <diff> บาท
+/// ⛽ ▶ <name>
+/// ปรับลด/เพิ่ม <diff> บาท
 /// จากราคา <old> บาท เป็น <new> บาท
 /// ```
-fn format_message(changes: &[PriceChange]) -> String {
+///
+/// When `effective_date` is empty (the API omitted `OilRemark2`),
+/// the date line is omitted entirely.
+fn format_message(effective_date: &str, effective_time: &str, changes: &[PriceChange]) -> String {
+    let header = if effective_date.is_empty() {
+        MESSAGE_HEADER.to_string()
+    } else if effective_time.is_empty() {
+        format!("{}\n{} {}", MESSAGE_HEADER, DATE_LABEL, effective_date)
+    } else {
+        format!(
+            "{}\n{} {} เวลา {} น.",
+            MESSAGE_HEADER, DATE_LABEL, effective_date, effective_time
+        )
+    };
+
     let mut body = Vec::with_capacity(changes.len());
     for change in changes {
         let direction = if change.is_increase() {
@@ -425,7 +549,9 @@ fn format_message(changes: &[PriceChange]) -> String {
             DIRECTION_DECREASE
         };
         body.push(format!(
-            "{} ปรับ{} {:.2} บาท\nจากราคา {:.2} บาท เป็น {:.2} บาท",
+            "{} {} {}\nปรับ{} {:.2} บาท\nจากราคา {:.2} บาท เป็น {:.2} บาท",
+            OIL_TYPE_BULLET,
+            OIL_TYPE_ARROW,
             change.name,
             direction,
             change.difference(),
@@ -433,7 +559,7 @@ fn format_message(changes: &[PriceChange]) -> String {
             change.new_price,
         ));
     }
-    format!("{}\n\n{}", MESSAGE_HEADER, body.join("\n\n"))
+    format!("{}\n\n{}", header, body.join("\n\n"))
 }
 
 // ---- State persistence -------------------------------------------------------
@@ -479,6 +605,8 @@ mod tests {
         PriceSnapshot {
             captured_at: "2026-06-21T18:00:00+07:00".to_string(),
             source_date: "21/06/2026".to_string(),
+            effective_date: "19 มิถุนายน 2026".to_string(),
+            effective_time: "05:00".to_string(),
             entries,
         }
     }
@@ -520,9 +648,11 @@ mod tests {
             old_price: 31.00,
             new_price: 30.50,
         }];
-        let message = format_message(&changes);
+        let message = format_message("19 มิถุนายน 2026", "05:00", &changes);
         assert!(message.starts_with("📰 แจ้งข่าวราคาน้ำมัน!!"));
-        assert!(message.contains("Gasohol 95 ปรับลด 0.50 บาท"));
+        assert!(message.contains("📅 ราคาปรับขึ้น-ลง วันที่ 19 มิถุนายน 2026 เวลา 05:00 น."));
+        assert!(message.contains("⛽ ▶ Gasohol 95"));
+        assert!(message.contains("ปรับลด 0.50 บาท"));
         assert!(message.contains("จากราคา 31.00 บาท เป็น 30.50 บาท"));
     }
 
@@ -533,8 +663,9 @@ mod tests {
             old_price: 32.50,
             new_price: 33.00,
         }];
-        let message = format_message(&changes);
-        assert!(message.contains("Diesel B20 ปรับเพิ่ม 0.50 บาท"));
+        let message = format_message("19 มิถุนายน 2026", "05:00", &changes);
+        assert!(message.contains("⛽ ▶ Diesel B20"));
+        assert!(message.contains("ปรับเพิ่ม 0.50 บาท"));
         assert!(message.contains("จากราคา 32.50 บาท เป็น 33.00 บาท"));
     }
 
@@ -552,7 +683,33 @@ mod tests {
                 new_price: 33.00,
             },
         ];
-        let message = format_message(&changes);
-        assert!(message.contains("\n\nDiesel B20"));
+        let message = format_message("", "", &changes);
+        assert!(message.contains("\n\n⛽ ▶ Diesel B20"));
+    }
+
+    #[test]
+    fn format_message_omits_date_line_when_empty() {
+        let changes = vec![PriceChange {
+            name: "Gasohol 95".to_string(),
+            old_price: 31.00,
+            new_price: 30.50,
+        }];
+        let message = format_message("", "", &changes);
+        assert!(message.starts_with("📰 แจ้งข่าวราคาน้ำมัน!!"));
+        assert!(!message.contains("📅"));
+    }
+
+    #[test]
+    fn parse_effective_datetime_extracts_thai_date_and_time() {
+        let (date, time) = parse_effective_datetime("Are effective on 19 June 2026 from 05:00 AM");
+        assert_eq!(date, "19 มิถุนายน 2026");
+        assert_eq!(time, "05:00");
+    }
+
+    #[test]
+    fn parse_effective_datetime_returns_empty_on_garbage_input() {
+        let (date, time) = parse_effective_datetime("not a valid remark");
+        assert!(date.is_empty());
+        assert!(time.is_empty());
     }
 }
