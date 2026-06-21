@@ -5,7 +5,7 @@ on:
     branches: [main, master]
   schedule:
     # 18:00 and 20:00 Asia/Bangkok (UTC+7) = 11:00 and 13:00 UTC
-    - cron: '0 11,13 * * *'
+    - cron: "0 11,13 * * *"
   workflow_dispatch: # Manual trigger from GitHub Actions UI
 
 env:
@@ -27,16 +27,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: last_fuel_prices.json
-          key: fuel-price-state-${{ github.run_id }}-${{ github.run_attempt }}
+          key: fuel-price-state-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            fuel-price-state-
+            fuel-price-state-v2-
 
       - name: Run fuel price check
         env:
           STATE_FILE: last_fuel_prices.json
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_TARGET_ID: ${{ secrets.LINE_TARGET_ID }}
-          RUN_ONCE: '1'
+          RUN_ONCE: "1"
         run: cargo run --release
 
       - name: Save dedup state
@@ -44,4 +44,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: last_fuel_prices.json
-          key: fuel-price-state-${{ github.run_id }}-${{ github.run_attempt }}
+          key: fuel-price-state-v2-${{ github.run_id }}-${{ github.run_attempt }}

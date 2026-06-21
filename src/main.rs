@@ -230,6 +230,14 @@ fn build_config() -> Result<AppConfig> {
 }
 
 /// Single scheduled tick: fetch → compute changes → deduplicate → notify → persist.
+///
+/// State is only persisted when one of these is true:
+/// - No price changes were detected (nothing to notify).
+/// - We already notified for this `OilPriceDate` (idempotent re-write).
+/// - The LINE push actually succeeded.
+///
+/// If credentials are missing or the push fails, state is NOT persisted,
+/// so the next scheduled run will retry with the same `OilPriceDate`.
 async fn run_once(config: &AppConfig) -> Result<()> {
     let now = chrono::Utc::now().with_timezone(&Bangkok);
     info!(%now, "scheduled tick starting");
@@ -257,8 +265,20 @@ async fn run_once(config: &AppConfig) -> Result<()> {
         );
     } else {
         info!(changed_count = changes.len(), "price changes detected");
+
+        // Guard the push: if credentials are missing, do NOT persist state —
+        // otherwise the next run would think we already notified and skip.
+        if config.line_target.is_none() || config.line_token.is_none() {
+            warn!("LINE credentials missing — NOT persisting state, will retry next run");
+            return Ok(());
+        }
+
         if let Err(error) = notify_line(config, &changes).await {
-            warn!(error = %error, "LINE push failed — continuing to persist snapshot");
+            warn!(
+                error = %error,
+                "LINE push failed — NOT persisting state, will retry next run"
+            );
+            return Ok(());
         }
     }
 
